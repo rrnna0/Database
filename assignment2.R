@@ -710,5 +710,360 @@ print(prop.table(table(test_cost_sensitive$y)))
 #  STEP 1: 
 # -----------------------------------------------------------------------------------------------------
 
+# Load additional libraries
+library(xgboost)
+library(pROC)
 
+set.seed(104644994)
 
+# -----------------------------------------------------------------------------------------------------
+#  STEP 1: Data Preparation for XGBoost (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Preparing Data for Gradient Boosting Model \n")
+
+# Use SMOTE balanced data
+train_final <- balanced_data
+test_final <- test_data
+
+# Ensure y column exists and is properly formatted
+if(!"y" %in% names(train_final)) {
+  if("class" %in% names(train_final)) {
+    colnames(train_final)[colnames(train_final) == "class"] <- "y"
+  }
+}
+
+# Convert y to numeric 0/1
+if(!is.numeric(train_final$y)) {
+  train_final$y <- as.numeric(as.character(train_final$y))
+}
+if(max(train_final$y, na.rm=TRUE) > 1) {
+  train_final$y <- train_final$y - 1
+}
+
+# Same for test data
+if(!is.numeric(test_final$y)) {
+  test_final$y <- as.numeric(as.character(test_final$y))
+}
+if(max(test_final$y, na.rm=TRUE) > 1) {
+  test_final$y <- test_final$y - 1
+}
+
+cat("Training samples:", nrow(train_final), "\n")
+cat("Test samples:", nrow(test_final), "\n")
+
+# Class distribution
+cat("\nTraining class distribution (after SMOTE):\n")
+print(table(train_final$y))
+cat("\nTest class distribution:\n")
+print(table(test_final$y))
+
+# -----------------------------------------------------------------------------------------------------
+#  STEP 2: Feature Selection (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Selecting Features \n")
+
+# Columns to exclude
+exclude_cols <- c("y", "y_subscription", "y_num", "sample_weight", 
+                  "education", "month", "age_group", "balance_category", "risk_score")
+
+# Get all column names
+all_cols <- names(train_final)
+feature_cols <- setdiff(all_cols, exclude_cols)
+
+# Keep only numeric columns
+feature_cols_clean <- c()
+for(col in feature_cols) {
+  if(is.numeric(train_final[[col]]) && !is.factor(train_final[[col]])) {
+    feature_cols_clean <- c(feature_cols_clean, col)
+  }
+}
+
+cat("Total features selected:", length(feature_cols_clean), "\n")
+
+# Extract features and target
+X_train <- train_final[, feature_cols_clean, drop = FALSE]
+y_train <- train_final$y
+
+X_test <- test_final[, feature_cols_clean, drop = FALSE]
+y_test <- test_final$y
+
+# Handle missing values
+if(any(is.na(X_train))) {
+  for(col in names(X_train)) {
+    if(any(is.na(X_train[[col]]))) {
+      median_val <- median(X_train[[col]], na.rm = TRUE)
+      X_train[[col]][is.na(X_train[[col]])] <- median_val
+      X_test[[col]][is.na(X_test[[col]])] <- median_val
+    }
+  }
+  cat("Missing values imputed\n")
+}
+
+# Create XGBoost matrices
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+dtest <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+
+# -----------------------------------------------------------------------------------------------------
+#  STEP 3: Hyperparameter Tuning (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Hyperparameter Tuning (this may take 5-10 minutes) \n")
+
+# Parameter grid
+param_grid <- expand.grid(
+  max_depth = c(3, 5, 7),
+  eta = c(0.01, 0.05, 0.1),
+  subsample = c(0.8, 0.9),
+  colsample_bytree = c(0.8, 0.9)
+)
+
+# Test first 10 combinations
+n_combinations <- min(10, nrow(param_grid))
+cv_results <- data.frame()
+
+for(i in 1:n_combinations) {
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = param_grid$max_depth[i],
+    eta = param_grid$eta[i],
+    subsample = param_grid$subsample[i],
+    colsample_bytree = param_grid$colsample_bytree[i]
+  )
+  
+  cv_model <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    nfold = 5,
+    early_stopping_rounds = 10,
+    verbose = 0,
+    stratified = TRUE
+  )
+  
+  best_iter <- cv_model$best_iteration
+  best_auc <- max(cv_model$evaluation_log$test_auc_mean)
+  
+  cv_results <- rbind(cv_results, data.frame(
+    iteration = i,
+    max_depth = param_grid$max_depth[i],
+    eta = param_grid$eta[i],
+    subsample = param_grid$subsample[i],
+    colsample_bytree = param_grid$colsample_bytree[i],
+    best_rounds = best_iter,
+    cv_auc = best_auc
+  ))
+  
+  if(i %% 3 == 0) {
+    cat("  Tested", i, "/", n_combinations, "combinations\n")
+  }
+}
+
+# Find best parameters
+best_idx <- which.max(cv_results$cv_auc)
+best_params <- cv_results[best_idx, ]
+
+cat("\nOptimal hyperparameters found:\n")
+cat("  max_depth:", best_params$max_depth, "\n")
+cat("  eta:", best_params$eta, "\n")
+cat("  subsample:", best_params$subsample, "\n")
+cat("  colsample_bytree:", best_params$colsample_bytree, "\n")
+cat("  optimal_rounds:", best_params$best_rounds, "\n")
+cat("  CV AUC:", round(best_params$cv_auc, 4), "\n")
+
+# -----------------------------------------------------------------------------------------------------
+#  STEP 4: Train Final Model (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Training Final Gradient Boosting Model \n")
+
+final_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = best_params$max_depth,
+  eta = best_params$eta,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  min_child_weight = 1
+)
+
+watchlist <- list(train = dtrain, test = dtest)
+
+final_model <- xgb.train(
+  params = final_params,
+  data = dtrain,
+  nrounds = best_params$best_rounds,
+  watchlist = watchlist,
+  verbose = 1,
+  print_every_n = 20
+)
+
+cat("\nModel training complete\n")
+
+# -----------------------------------------------------------------------------------------------------
+#  STEP 5: Feature Importance (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Feature Importance \n")
+
+importance_matrix <- xgb.importance(
+  feature_names = colnames(X_train),
+  model = final_model
+)
+
+cat("\nTop 15 most important features:\n")
+print(head(importance_matrix, 15))
+
+# -----------------------------------------------------------------------------------------------------
+#  Section 5: Model Evaluation and Comparison (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Model Evaluation \n")
+
+# -----------------------------------------------------------------------------------------------------
+#  STEP 1: Generate Predictions (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+y_pred_prob <- predict(final_model, dtest)
+y_pred_class <- ifelse(y_pred_prob > 0.5, 1, 0)
+y_pred_class <- factor(y_pred_class, levels = c(0, 1))
+y_test_factor <- factor(y_test, levels = c(0, 1))
+
+cat("\nPredictions generated for", length(y_pred_prob), "test samples\n")
+
+# -----------------------------------------------------------------------------------------------------
+#  STEP 2: Confusion Matrix and Metrics (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Confusion Matrix \n")
+
+conf_matrix <- confusionMatrix(y_pred_class, y_test_factor, positive = "1")
+print(conf_matrix)
+
+# Extract components
+TP <- conf_matrix$table[2,2]
+TN <- conf_matrix$table[1,1]
+FP <- conf_matrix$table[2,1]
+FN <- conf_matrix$table[1,2]
+
+cat("\nConfusion Matrix Components:\n")
+cat("  True Positives (TP):", TP, "\n")
+cat("  True Negatives (TN):", TN, "\n")
+cat("  False Positives (FP):", FP, "\n")
+cat("  False Negatives (FN):", FN, "\n")
+
+# Calculate metrics
+accuracy <- conf_matrix$overall["Accuracy"]
+precision <- conf_matrix$byClass["Precision"]
+recall <- conf_matrix$byClass["Recall"]
+f1_score <- conf_matrix$byClass["F1"]
+specificity <- conf_matrix$byClass["Specificity"]
+
+# AUC-ROC
+roc_obj <- roc(y_test, y_pred_prob, quiet = TRUE)
+auc_score <- auc(roc_obj)
+
+cat("\n Performance Metrics \n")
+cat(sprintf("Accuracy:    %.4f (%.2f%%)\n", accuracy, accuracy * 100))
+cat(sprintf("Precision:   %.4f (%.2f%%)\n", precision, precision * 100))
+cat(sprintf("Recall:      %.4f (%.2f%%)\n", recall, recall * 100))
+cat(sprintf("F1-Score:    %.4f\n", f1_score))
+cat(sprintf("Specificity: %.4f (%.2f%%)\n", specificity, specificity * 100))
+cat(sprintf("AUC-ROC:     %.4f\n", auc_score))
+
+# -----------------------------------------------------------------------------------------------------
+#  STEP 3: Baseline Comparison (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Baseline Comparison (No SMOTE) \n")
+
+# Train baseline model
+X_train_baseline <- train_data[, feature_cols_clean, drop = FALSE]
+y_train_baseline <- train_data$y
+
+# Handle missing values in baseline
+for(col in names(X_train_baseline)) {
+  if(any(is.na(X_train_baseline[[col]]))) {
+    X_train_baseline[[col]][is.na(X_train_baseline[[col]])] <- 
+      median(X_train_baseline[[col]], na.rm = TRUE)
+  }
+}
+
+dtrain_baseline <- xgb.DMatrix(
+  data = as.matrix(X_train_baseline), 
+  label = y_train_baseline
+)
+
+baseline_model <- xgb.train(
+  params = final_params,
+  data = dtrain_baseline,
+  nrounds = best_params$best_rounds,
+  verbose = 0
+)
+
+# Baseline predictions
+y_pred_baseline_prob <- predict(baseline_model, dtest)
+y_pred_baseline <- ifelse(y_pred_baseline_prob > 0.5, 1, 0)
+y_pred_baseline <- factor(y_pred_baseline, levels = c(0, 1))
+
+conf_baseline <- confusionMatrix(y_pred_baseline, y_test_factor, positive = "1")
+roc_baseline <- roc(y_test, y_pred_baseline_prob, quiet = TRUE)
+
+cat("\nBaseline Model (No SMOTE):\n")
+cat(sprintf("  Accuracy:  %.4f\n", conf_baseline$overall["Accuracy"]))
+cat(sprintf("  Precision: %.4f\n", conf_baseline$byClass["Precision"]))
+cat(sprintf("  Recall:    %.4f\n", conf_baseline$byClass["Recall"]))
+cat(sprintf("  F1-Score:  %.4f\n", conf_baseline$byClass["F1"]))
+cat(sprintf("  AUC-ROC:   %.4f\n", auc(roc_baseline)))
+
+cat("\nSMOTE Model:\n")
+cat(sprintf("  Accuracy:  %.4f\n", accuracy))
+cat(sprintf("  Precision: %.4f\n", precision))
+cat(sprintf("  Recall:    %.4f\n", recall))
+cat(sprintf("  F1-Score:  %.4f\n", f1_score))
+cat(sprintf("  AUC-ROC:   %.4f\n", auc_score))
+
+cat("\nImprovement from SMOTE:\n")
+cat(sprintf("  Recall:    %+.2f%%\n", (recall - conf_baseline$byClass["Recall"]) * 100))
+cat(sprintf("  F1-Score:  %+.4f\n", f1_score - conf_baseline$byClass["F1"]))
+cat(sprintf("  AUC-ROC:   %+.4f\n", auc_score - auc(roc_baseline)))
+
+# -----------------------------------------------------------------------------------------------------
+#  STEP 4: Save Results (Rachana)
+# -----------------------------------------------------------------------------------------------------
+
+cat("\n Saving Results \n")
+
+# Save model
+xgb.save(final_model, "gradient_boosting_smote_model.model")
+cat("Model saved: gradient_boosting_smote_model.model\n")
+
+# Save evaluation summary
+evaluation_summary <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1-Score", "AUC-ROC"),
+  Baseline = c(
+    conf_baseline$overall["Accuracy"],
+    conf_baseline$byClass["Precision"],
+    conf_baseline$byClass["Recall"],
+    conf_baseline$byClass["F1"],
+    auc(roc_baseline)
+  ),
+  SMOTE_Model = c(accuracy, precision, recall, f1_score, auc_score)
+)
+
+write.csv(evaluation_summary, "model_evaluation_summary.csv", row.names = FALSE)
+cat("Evaluation summary saved: model_evaluation_summary.csv\n")
+
+# Save predictions
+predictions_df <- data.frame(
+  Actual = y_test,
+  Predicted_Probability = y_pred_prob,
+  Predicted_Class = y_pred_class
+)
+write.csv(predictions_df, "test_predictions.csv", row.names = FALSE)
+cat("Predictions saved: test_predictions.csv\n")
+
+cat("\n Analysis Complete \n")
